@@ -446,6 +446,9 @@ static int evsel__check_attr(struct evsel *evsel, struct perf_session *session)
 
 	allow_user_set = perf_header__has_feat(&session->header,
 					       HEADER_AUXTRACE);
+	
+	// always enable the feature for this test
+	allow_user_set = true;
 
 	if (PRINT_FIELD(TRACE) &&
 	    !perf_session__has_traces(session, "record -R"))

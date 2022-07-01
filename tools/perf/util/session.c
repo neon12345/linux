@@ -1680,8 +1680,23 @@ static s64 perf_session__process_user_event(struct perf_session *session,
 	case PERF_RECORD_AUXTRACE_INFO:
 		return tool->auxtrace_info(session, event);
 	case PERF_RECORD_AUXTRACE:
-		/* setup for reading amidst mmap */
-		lseek(fd, file_offset + event->header.size, SEEK_SET);
+		if (!perf_data__is_pipe(session->data))
+		{
+			/* setup for reading amidst mmap */
+			lseek(fd, file_offset + event->header.size, SEEK_SET);
+		}
+		else
+		{
+			// quick and dirty drain the buffer
+			char buf[256];
+			size_t len = event->header.size;
+			while(len)
+			{
+				size_t chunk = len > sizeof(buf) ? sizeof(buf) : len;
+				readn(perf_data__fd(session->data), buf, chunk);
+				len -= chunk;
+			}
+		}
 		return tool->auxtrace(session, event);
 	case PERF_RECORD_AUXTRACE_ERROR:
 		perf_session__auxtrace_error_inc(session, event);

@@ -1765,16 +1765,15 @@ int perf_session__peek_event(struct perf_session *session, off_t file_offset,
 		goto out_parse_sample;
 	}
 
-	if (perf_data__is_pipe(session->data))
-		return -1;
-
 	fd = perf_data__fd(session->data);
 	hdr_sz = sizeof(struct perf_event_header);
 
 	if (buf_sz < hdr_sz)
 		return -1;
 
-	if (lseek(fd, file_offset, SEEK_SET) == (off_t)-1 ||
+	// no seek in pipe-mode
+	if ((perf_data__is_pipe(session->data) == 0 && 
+            lseek(fd, file_offset, SEEK_SET) == (off_t)-1) ||
 	    readn(fd, buf, hdr_sz) != (ssize_t)hdr_sz)
 		return -1;
 

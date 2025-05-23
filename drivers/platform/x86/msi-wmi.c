@@ -14,6 +14,7 @@
 #include <linux/input/sparse-keymap.h>
 #include <linux/acpi.h>
 #include <linux/backlight.h>
+#include <linux/dmi.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <acpi/video.h>
@@ -27,6 +28,8 @@ MODULE_LICENSE("GPL");
 #define MSIWMI_BIOS_GUID "551A1F84-FBDD-4125-91DB-3EA8F44F1D45"
 #define MSIWMI_MSI_EVENT_GUID "B6F3EEF2-3D2F-49DC-9DE3-85BCE18C62F2"
 #define MSIWMI_WIND_EVENT_GUID "5B3CC38A-40D9-7245-8AE6-1145B751BE3F"
+
+#define TABLET_MODE_SUPPORT			BIT(1)
 
 MODULE_ALIAS("wmi:" MSIWMI_BIOS_GUID);
 MODULE_ALIAS("wmi:" MSIWMI_MSI_EVENT_GUID);
@@ -87,6 +90,28 @@ static struct backlight_device *backlight;
 static int backlight_map[] = { 0x00, 0x33, 0x66, 0x99, 0xCC, 0xFF };
 
 static struct input_dev *msi_wmi_input_dev;
+
+static unsigned long device_options;
+
+static int msi_laptop_dmi_setup(const struct dmi_system_id *id)
+{
+	pr_info("Identified MSI model '%s'\n", id->ident);
+	device_options = (unsigned long)id->driver_data;
+	return 1;
+}
+
+static const struct dmi_system_id msi_laptop_dmi_table[] = {
+	{
+		.callback = msi_laptop_dmi_setup,
+		.ident = "Summit A16 AI+ A3HMTG",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Micro-Star International Co., Ltd."),
+			DMI_MATCH(DMI_PRODUCT_NAME, "Summit A16 AI+ A3HMTG"),
+		},
+		.driver_data = (void *)TABLET_MODE_SUPPORT
+	},
+	{}
+};
 
 static int msi_wmi_query_block(int instance, int *ret)
 {
@@ -170,6 +195,49 @@ static const struct backlight_ops msi_backlight_ops = {
 	.update_status	= bl_set_status,
 };
 
+static int tablet_mode = -1;
+
+static void check_tablet_mode(void)
+{
+	u8 val = 0x01;
+	int mode = tablet_mode;
+	ec_read(0xEE, &val);
+	tablet_mode = val & 0x01;
+	if (mode != tablet_mode) {
+		input_report_switch(msi_wmi_input_dev, SW_TABLET_MODE, tablet_mode);
+		input_sync(msi_wmi_input_dev);
+	}
+}
+
+static void init_tablet_mode(void)
+{
+	u8 val = 0x00;
+	ec_read(0xD9, &val);
+	if ((val & 0x01) != 0x01) {
+		ec_write(0xD9, val | 0x01);
+		tablet_mode = -1;
+		check_tablet_mode();
+	}
+}
+
+static int tablet_power_event(struct notifier_block *this, unsigned long event,
+							 void *ptr)
+{
+	switch (event) {
+		case PM_POST_HIBERNATION:
+		case PM_POST_SUSPEND:
+			init_tablet_mode();
+			break;
+		default:
+			break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block tablet_power_notifier = {
+	.notifier_call = tablet_power_event,
+};
+
 static void msi_wmi_notify(union acpi_object *obj, void *context)
 {
 	struct key_entry *key;
@@ -207,6 +275,21 @@ static void msi_wmi_notify(union acpi_object *obj, void *context)
 				 key->code, key->keycode);
 			sparse_keymap_report_entry(msi_wmi_input_dev, key, 1,
 						   true);
+		}
+	} else if (obj && obj->type == ACPI_TYPE_BUFFER && obj->buffer.length == 2) {
+		u16 event = *(u16*)obj->buffer.pointer;
+
+		switch (event) {
+			case 0x273:	// tablet mode
+			case 0xB7B:	// normal mode
+				if (device_options & TABLET_MODE_SUPPORT) {
+					check_tablet_mode();
+					break;
+				}
+				fallthrough;
+			default:
+				pr_info("Unknown buffer event: 0x%hX\n", event);
+				break;
 		}
 	} else
 		pr_info("Unknown event received\n");
@@ -249,6 +332,9 @@ static int __init msi_wmi_input_setup(void)
 	msi_wmi_input_dev->phys = "wmi/input0";
 	msi_wmi_input_dev->id.bustype = BUS_HOST;
 
+	if (device_options & TABLET_MODE_SUPPORT)
+		input_set_capability(msi_wmi_input_dev, EV_SW, SW_TABLET_MODE);
+
 	err = sparse_keymap_setup(msi_wmi_input_dev, msi_wmi_keymap, NULL);
 	if (err)
 		goto err_free_dev;
@@ -271,6 +357,8 @@ static int __init msi_wmi_init(void)
 {
 	int err;
 	int i;
+
+	dmi_check_system(msi_laptop_dmi_table);
 
 	for (i = 0; i < ARRAY_SIZE(event_wmis); i++) {
 		if (!wmi_has_guid(event_wmis[i].guid))
@@ -309,6 +397,15 @@ static int __init msi_wmi_init(void)
 		return -ENODEV;
 	}
 
+	if (device_options & TABLET_MODE_SUPPORT) {
+		err = register_pm_notifier(&tablet_power_notifier);
+		if (err)
+			goto err_uninstall_handler;
+
+		init_tablet_mode();
+	}
+
+
 	return 0;
 
 err_uninstall_handler:
@@ -322,6 +419,10 @@ err_free_input:
 
 static void __exit msi_wmi_exit(void)
 {
+	if (device_options & TABLET_MODE_SUPPORT) {
+		unregister_pm_notifier(&tablet_power_notifier);
+	}
+
 	if (event_wmi) {
 		wmi_remove_notify_handler(event_wmi->guid);
 		input_unregister_device(msi_wmi_input_dev);

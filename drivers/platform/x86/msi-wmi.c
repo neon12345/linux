@@ -29,7 +29,9 @@ MODULE_LICENSE("GPL");
 #define MSIWMI_MSI_EVENT_GUID "B6F3EEF2-3D2F-49DC-9DE3-85BCE18C62F2"
 #define MSIWMI_WIND_EVENT_GUID "5B3CC38A-40D9-7245-8AE6-1145B751BE3F"
 
+
 #define TABLET_MODE_SUPPORT			BIT(1)
+#define TABLET_MODE_INIT			BIT(2)
 
 MODULE_ALIAS("wmi:" MSIWMI_BIOS_GUID);
 MODULE_ALIAS("wmi:" MSIWMI_MSI_EVENT_GUID);
@@ -91,12 +93,31 @@ static int backlight_map[] = { 0x00, 0x33, 0x66, 0x99, 0xCC, 0xFF };
 
 static struct input_dev *msi_wmi_input_dev;
 
-static unsigned long device_options;
+struct device_option_conf {
+	u32 flags;
+	u8 tablet_init_addr;
+	u8 tablet_init_bitmask;
+	u8 tablet_state_addr;
+	u8 tablet_state_bitmask;
+};
+
+static struct device_option_conf option_empty = {
+	.flags = 0
+};
+static struct device_option_conf option_D9_01_EE_01 = {
+	.flags = TABLET_MODE_SUPPORT | TABLET_MODE_INIT,
+	.tablet_init_addr = 0xD9,
+	.tablet_init_bitmask = 0x01,
+	.tablet_state_addr = 0xEE,
+	.tablet_state_bitmask = 0x01
+};
+
+static struct device_option_conf* device_options = &option_empty;
 
 static int msi_laptop_dmi_setup(const struct dmi_system_id *id)
 {
 	pr_info("Identified MSI model '%s'\n", id->ident);
-	device_options = (unsigned long)id->driver_data;
+	device_options = (struct device_option_conf*)id->driver_data;
 	return 1;
 }
 
@@ -108,7 +129,7 @@ static const struct dmi_system_id msi_laptop_dmi_table[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Micro-Star International Co., Ltd."),
 			DMI_MATCH(DMI_PRODUCT_NAME, "Summit A16 AI+ A3HMTG"),
 		},
-		.driver_data = (void *)TABLET_MODE_SUPPORT
+		.driver_data = (void *)&option_D9_01_EE_01
 	},
 	{}
 };
@@ -199,25 +220,34 @@ static int tablet_mode = -1;
 
 static void check_tablet_mode(void)
 {
-	u8 val = 0x01;
+	u8 val;
+	u8 addr = device_options->tablet_state_addr;
+	u8 bitmask = device_options->tablet_state_bitmask;
 	int mode = tablet_mode;
-	ec_read(0xEE, &val);
-	tablet_mode = val & 0x01;
-	if (mode != tablet_mode) {
-		input_report_switch(msi_wmi_input_dev, SW_TABLET_MODE, tablet_mode);
-		input_sync(msi_wmi_input_dev);
+	if (ec_read(addr, &val) == 0) {
+		tablet_mode = val & bitmask;
+		if (mode != tablet_mode) {
+			input_report_switch(msi_wmi_input_dev, SW_TABLET_MODE, tablet_mode);
+			input_sync(msi_wmi_input_dev);
+		}
 	}
 }
 
 static void init_tablet_mode(void)
 {
-	u8 val = 0x00;
-	ec_read(0xD9, &val);
-	if ((val & 0x01) != 0x01) {
-		ec_write(0xD9, val | 0x01);
-		tablet_mode = -1;
-		check_tablet_mode();
+	if (device_options->flags & TABLET_MODE_INIT) {
+		u8 val;
+		u8 addr = device_options->tablet_init_addr;
+		u8 bitmask = device_options->tablet_init_bitmask;
+		if (ec_read(addr, &val) == 0) {
+			if ((val & bitmask) != bitmask) {
+				if (ec_write(addr, val | bitmask) == 0)
+					tablet_mode = -1;
+			}
+		}
 	}
+
+	check_tablet_mode();
 }
 
 static int tablet_power_event(struct notifier_block *this, unsigned long event,
@@ -282,7 +312,7 @@ static void msi_wmi_notify(union acpi_object *obj, void *context)
 		switch (event) {
 			case 0x273:	// tablet mode
 			case 0xB7B:	// normal mode
-				if (device_options & TABLET_MODE_SUPPORT) {
+				if (device_options->flags & TABLET_MODE_SUPPORT) {
 					check_tablet_mode();
 					break;
 				}
@@ -332,7 +362,7 @@ static int __init msi_wmi_input_setup(void)
 	msi_wmi_input_dev->phys = "wmi/input0";
 	msi_wmi_input_dev->id.bustype = BUS_HOST;
 
-	if (device_options & TABLET_MODE_SUPPORT)
+	if (device_options->flags & TABLET_MODE_SUPPORT)
 		input_set_capability(msi_wmi_input_dev, EV_SW, SW_TABLET_MODE);
 
 	err = sparse_keymap_setup(msi_wmi_input_dev, msi_wmi_keymap, NULL);
@@ -397,7 +427,7 @@ static int __init msi_wmi_init(void)
 		return -ENODEV;
 	}
 
-	if (device_options & TABLET_MODE_SUPPORT) {
+	if (device_options->flags & TABLET_MODE_SUPPORT) {
 		err = register_pm_notifier(&tablet_power_notifier);
 		if (err)
 			goto err_uninstall_handler;
@@ -419,7 +449,7 @@ err_free_input:
 
 static void __exit msi_wmi_exit(void)
 {
-	if (device_options & TABLET_MODE_SUPPORT) {
+	if (device_options->flags & TABLET_MODE_SUPPORT) {
 		unregister_pm_notifier(&tablet_power_notifier);
 	}
 
